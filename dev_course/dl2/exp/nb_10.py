@@ -110,6 +110,8 @@ def warp(img, size, src_coords, resample=PIL.Image.BILINEAR):
     res = img.transform(size, PIL.Image.PERSPECTIVE, list(c), resample=resample)
     return res
 
+def uniform(a,b): return a + (b-a) * random.random()
+
 class PilTiltRandomCrop(PilTransform):
     def __init__(self, size, crop_size=None, magnitude=0., resample=PIL.Image.BILINEAR):
         self.resample,self.size,self.magnitude = resample,process_sz(size),magnitude

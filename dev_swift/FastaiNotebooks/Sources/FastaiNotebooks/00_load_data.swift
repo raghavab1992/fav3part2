@@ -5,10 +5,10 @@ file to edit: 00_load_data.ipynb
 */
         
 import Foundation
-import Path
 import Just
+import Path
 
-public func shell_cmd(_ launchPath: String, _ arguments: [String]) -> String?
+public func shellCommand(_ launchPath: String, _ arguments: [String]) -> String?
 {
     let task = Process()
     task.executableURL = URL.init(fileURLWithPath:launchPath)
@@ -24,7 +24,7 @@ public func shell_cmd(_ launchPath: String, _ arguments: [String]) -> String?
     return output
 }
 
-public func download_file(_ url: String, dest: String?=nil, force: Bool=false){
+public func downloadFile(_ url: String, dest: String?=nil, force: Bool=false){
     let dest_name = (dest ?? (Path.cwd/url.split(separator: "/").last!).string)
     let url_dest = URL.init(fileURLWithPath: (dest ?? (Path.cwd/url.split(separator: "/").last!).string))
     if (force || !Path(dest_name)!.exists){
@@ -45,42 +45,37 @@ protocol ConvertableFromByte {
 extension Float : ConvertableFromByte{}
 extension Int32 : ConvertableFromByte{}
 
-func get_data<T:ConvertableFromByte & TensorFlowScalar>(_ fn:String, _ skip:Int) -> Tensor<T> {
-    let data = try! Data.init(contentsOf: URL.init(fileURLWithPath: fn)).dropFirst(skip)
-    return Tensor(data.map(T.init))
+func loadMNIST<T:ConvertableFromByte & TensorFlowScalar>(training: Bool, labels: Bool, path: Path) -> Tensor<T> {
+    let split = training ? "train" : "t10k"
+    let kind = labels ? "labels" : "images"
+    let batch = training ? Int32(60000) : Int32(10000)
+    let shape: TensorShape = labels ? [batch] : [batch, 28, 28]
+    let rank = shape.rank
+    let dropK = labels ? 8 : 16
+    let baseUrl = "http://yann.lecun.com/exdb/mnist/"
+    let fname = split + "-" + kind + "-idx\(rank)-ubyte"
+    let file = path/fname
+    if !file.exists {
+        downloadFile("\(baseUrl)\(fname).gz", dest:(path/"\(fname).gz").string)
+        _ = shellCommand("/bin/gunzip", ["-fq", (path/"\(fname).gz").string])
+    }
+    let data = try! Data.init(contentsOf: URL.init(fileURLWithPath: file.string)).dropFirst(dropK)
+    if labels { return Tensor(data.map(T.init)) }
+    else      { return Tensor(data.map(T.init)).reshaped(to: shape)}
 }
 
-public struct MnistDataset{
-    let base_url = "http://yann.lecun.com/exdb/mnist/"
-    let trn_imgs = "train-images-idx3-ubyte"
-    let trn_lbls = "train-labels-idx1-ubyte"
-    let val_imgs = "t10k-images-idx3-ubyte"
-    let val_lbls = "t10k-labels-idx1-ubyte" 
-    
-    var path = Path.cwd
-    
-    public init(path: Path){
-        self.path = path
-        if !path.exists {try! path.mkdir(.p)}
-        let data_files = [path/trn_imgs, path/trn_lbls, path/val_imgs, path/val_lbls]
-        for file in data_files{
-            if !file.exists {
-                let fname = file.basename()
-                download_file("\(base_url)\(fname).gz", dest:(path/"\(fname).gz").string)
-                _ = shell_cmd("/bin/gunzip", ["-fq", (path/"\(fname).gz").string])
-            }
-        }
-    }
-    
-    func get_data<T:ConvertableFromByte & TensorFlowScalar>(_ fn:String, _ skip:Int) -> Tensor<T> {
-        let data = try! Data.init(contentsOf: URL.init(fileURLWithPath: fn)).dropFirst(skip)
-        return Tensor(data.map(T.init))
-    }
-    
-    public var xTrain: Tensor<Float> {return get_data((path/trn_imgs).string, 16)/255.0}
-    public var yTrain: Tensor<Int32> {return get_data((path/trn_lbls).string, 8)}
-    public var xValid: Tensor<Float> {return get_data((path/val_imgs).string, 16)/255.0}
-    public var yValid: Tensor<Int32> {return get_data((path/val_lbls).string, 8)}
+public func loadMNIST(path:Path) -> (
+    Tensor<Float>,
+    Tensor<Int32>,
+    Tensor<Float>,
+    Tensor<Int32>
+) {
+    return (
+        loadMNIST(training: true, labels: false, path: path) / 255.0,
+        loadMNIST(training: true, labels: true, path: path),
+        loadMNIST(training: false, labels: false, path: path) / 255.0,
+        loadMNIST(training: false, labels: true, path: path)
+    )
 }
 
 import Dispatch
@@ -94,6 +89,7 @@ public func time(_ function: () -> ()) {
 }
 
 public func time(repeating: Int, _ function: () -> ()) {
+    function()
     var times:[Double] = []
     for _ in 1...repeating{
         let start = DispatchTime.now()
@@ -106,7 +102,7 @@ public func time(repeating: Int, _ function: () -> ()) {
     print("\(times.reduce(0.0, +)/Double(times.count)) ms")
 }
 
-func notebook2script(fname: String){
+public func notebookToScript(fname: String){
     let url_fname = URL.init(fileURLWithPath: fname)
     let last = fname.lastPathComponent
     let out_fname = (url_fname.deletingLastPathComponent().appendingPathComponent("FastaiNotebooks", isDirectory: true)
@@ -115,8 +111,8 @@ func notebook2script(fname: String){
                      .deletingPathExtension().appendingPathExtension("swift"))
     do{
         let data = try Data.init(contentsOf: url_fname)
-        let json_data = try! JSONSerialization.jsonObject(with: data, options: .allowFragments) as! [String: Any]
-        let cells = json_data["cells"] as! [[String:Any]]
+        let jsonData = try! JSONSerialization.jsonObject(with: data, options: .allowFragments) as! [String: Any]
+        let cells = jsonData["cells"] as! [[String:Any]]
         var module = """
 /*
 THIS FILE WAS AUTOGENERATED! DO NOT EDIT!
@@ -137,12 +133,12 @@ file to edit: \(fname.lastPathComponent)
     } catch {print("Can't read the content of \(fname)")}
 }
 
-public func export_notebooks(_ path: Path){
+public func exportNotebooks(_ path: Path){
     for entry in try! path.ls(){
         if entry.kind == Entry.Kind.file{
             if entry.path.basename().range(of: #"^\d*_.*ipynb$"#, options: .regularExpression) != nil { 
                 print("Converting \(entry.path.basename())")
-                notebook2script(fname: entry.path.basename())
+                notebookToScript(fname: entry.path.basename())
             }
         }
     }
