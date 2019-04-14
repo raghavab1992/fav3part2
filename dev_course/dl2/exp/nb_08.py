@@ -25,9 +25,9 @@ def get_files(path, extensions=None, recurse=False, include=None):
     extensions = {e.lower() for e in extensions}
     if recurse:
         res = []
-        for p,d,f in os.walk(path): # returns (dirpath, dirnames, filenames)
-            if include is not None: d[:] = [o for o in d if o in include]
-            else:                   d[:] = [o for o in d if not o.startswith('.')]
+        for i,(p,d,f) in enumerate(os.walk(path)): # returns (dirpath, dirnames, filenames)
+            if include is not None and i==0: d[:] = [o for o in d if o in include]
+            else:                            d[:] = [o for o in d if not o.startswith('.')]
             res += _get_files(p, f, extensions)
         return res
     else:
@@ -55,7 +55,7 @@ class ItemList(ListContainer):
         if isinstance(res,list): return [self._get(o) for o in res]
         return self._get(res)
 
-class ImageItemList(ItemList):
+class ImageList(ItemList):
     @classmethod
     def from_files(cls, path, extensions=None, recurse=True, include=None, **kwargs):
         if extensions is None: extensions = image_extensions
@@ -85,8 +85,9 @@ def split_by_func(ds, f):
 class SplitData():
     def __init__(self, train, valid): self.train,self.valid = train,valid
 
-    @property
-    def path(self): return self.train.path
+    def __getattr__(self,k): return getattr(self.train,k)
+    #This is needed if we want to pickle SplitData and be able to load it back without recursion errors
+    def __setstate__(self,data:Any): self.__dict__.update(data)
 
     @classmethod
     def split_by_func(cls, il, f):
@@ -107,34 +108,40 @@ class Processor():
 
 class CategoryProcessor(Processor):
     def __init__(self): self.vocab=None
-    def proc1(self, item):  return self.otoi[item]
-    def deproc1(self, idx): return self.vocab[idx]
 
     def process(self, items):
+        #The vocab is defined on the first use.
         if self.vocab is None:
             self.vocab = uniqueify(items)
             self.otoi  = {v:k for k,v in enumerate(self.vocab)}
         return [self.proc1(o) for o in items]
+    def proc1(self, item):  return self.otoi[item]
 
     def deprocess(self, idxs):
         assert self.vocab is not None
         return [self.deproc1(idx) for idx in idxs]
+    def deproc1(self, idx): return self.vocab[idx]
 
-class ProcessedItemList(ListContainer):
-    def __init__(self, inputs, processor):
-        self.processor = processor
-        items = processor.process(inputs)
-        super().__init__(items)
+#This is a bit different from what was seen during the lesson but it's necessary for NLP
+def _process(self, processors):
+    self.processors = listify(processors)
+    for proc in self.processors: self.items = proc.process(self.items)
+    return self
 
-    def obj(self, idx):
-        res = self[idx]
-        if isinstance(res,(tuple,list,Generator)): return self.processor.deprocess(res)
-        return self.processor.deproc1(idx)
+def _obj(self, idx):
+    res = self[idx]
+    for proc in self.processors:
+        res = proc.deprocess(res) if isinstance(res,(tuple,list,Generator)) else proc.deproc1(res)
+    return res
+
+ItemList.process = _process
+ItemList.obj = _obj
 
 def parent_labeler(fn): return fn.parent.name
 
 def _label_by_func(ds, f): return [f(o) for o in ds.items]
 
+#This is a bit different from what was seen during the lesson but it's necessary for NLP
 class LabeledData():
     def __init__(self, x, y): self.x,self.y = x,y
 
@@ -143,15 +150,15 @@ class LabeledData():
     def __len__(self): return len(self.x)
 
     @classmethod
-    def label_by_func(cls, sd, f, proc=None):
-        labels = _label_by_func(sd, f)
-        proc_labels = ProcessedItemList(labels, proc)
-        return cls(sd, proc_labels)
+    def label_by_func(cls, il, f, proc_x=None, proc_y=None):
+        labels = _label_by_func(il, f)
+        proc_inputs = il.process(proc_x)
+        proc_labels = ItemList(labels, path=il.path).process(proc_y)
+        return cls(il, proc_labels)
 
-def label_by_func(sd, f):
-    proc = CategoryProcessor()
-    train = LabeledData.label_by_func(sd.train, f, proc)
-    valid = LabeledData.label_by_func(sd.valid, f, proc)
+def label_by_func(sd, f, proc_x=None, proc_y=None):
+    train = LabeledData.label_by_func(sd.train, f, proc_x=proc_x, proc_y=proc_y)
+    valid = LabeledData.label_by_func(sd.valid, f, proc_x=proc_x, proc_y=proc_y)
     return SplitData(train,valid)
 
 class ResizeFixed(Transform):
@@ -186,6 +193,12 @@ class DataBunch():
     @property
     def valid_ds(self): return self.valid_dl.dataset
 
+def databunchify(sd, bs, c_in=None, c_out=None, **kwargs):
+    dls = get_dls(sd.train, sd.valid, bs, **kwargs)
+    return DataBunch(*dls, c_in=c_in, c_out=c_out)
+
+SplitData.to_databunch = databunchify
+
 def normalize_chan(x, mean, std):
     return (x-mean[...,None,None]) / std[...,None,None]
 
@@ -194,20 +207,19 @@ _s = tensor([0.29, 0.28, 0.30])
 norm_imagenette = partial(normalize_chan, mean=_m.cuda(), std=_s.cuda())
 
 import math
-def next_pow_2(x): return 2**math.ceil(math.log2(x))
+def prev_pow_2(x): return 2**math.floor(math.log2(x))
 
 def get_cnn_layers(data, nfs, layer, **kwargs):
     def f(ni, nf, stride=2): return layer(ni, nf, 3, stride=stride, **kwargs)
     l1 = data.c_in
-    l2 = next_pow_2(l1*2)
+    l2 = prev_pow_2(l1*3*3)
     layers =  [f(l1  , l2  , stride=1),
-               f(l2  , l2*2, stride=1),
-               f(l2*2, l2*4, stride=1)]
+               f(l2  , l2*2, stride=2),
+               f(l2*2, l2*4, stride=2)]
     nfs = [l2*4] + nfs
     layers += [f(nfs[i], nfs[i+1]) for i in range(len(nfs)-1)]
     layers += [nn.AdaptiveAvgPool2d(1), Lambda(flatten),
-               nn.Linear(nfs[-1], data.c_out),
-               nn.BatchNorm1d(data.c_out)]
+               nn.Linear(nfs[-1], data.c_out)]
     return layers
 
 def get_cnn_model(data, nfs, layer, **kwargs):
@@ -217,3 +229,11 @@ def get_learn_run(nfs, data, lr, layer, cbs=None, opt_func=None, **kwargs):
     model = get_cnn_model(data, nfs, layer, **kwargs)
     init_cnn(model)
     return get_runner(model, data, lr=lr, cbs=cbs, opt_func=opt_func)
+
+def model_summary(run, learn, find_all=False):
+    xb,yb = get_batch(data.valid_dl, run)
+    device = next(learn.model.parameters()).device#Model may not be on the GPU yet
+    xb,yb = xb.to(device),yb.to(device)
+    mods = find_modules(learn.model, is_lin_layer) if find_all else learn.model.children()
+    f = lambda hook,mod,inp,out: print(f"{mod}\n{out.shape}\n")
+    with Hooks(mods, f) as hooks: learn.model(xb)
